@@ -41,6 +41,16 @@ npm run build && npm start
 npm test
 ```
 
+## 部署到網路上（GitHub + Vercel，免費）
+
+1. 把這個專案推送到你的 GitHub repository。
+2. 到 [vercel.com](https://vercel.com) 用 GitHub 帳號登入，按 **Add New → Project**。
+3. 選擇這個 repository 後按 **Import**，設定都用預設值（Vercel 會自動偵測 Next.js），再按 **Deploy**。
+4. 約 1–2 分鐘後會得到一個網址，例如 `https://stock-advisor-xxx.vercel.app`。
+5. 之後每次推送到 GitHub 的 `main` 分支，網站都會自動更新。
+
+選填：在 Vercel 專案的 **Settings → Environment Variables** 可以設定下方的環境變數。
+
 ## 設定 AI 模型
 
 進入網站的「設定」頁面，選擇服務商並填入：
