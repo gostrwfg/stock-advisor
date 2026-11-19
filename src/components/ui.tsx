@@ -106,6 +106,7 @@ export function DemoBanner() {
   return (
     <div className="rounded-xl border border-[var(--warn)]/40 bg-warn-soft p-3 text-sm text-warn">
       目前無法連線到行情資料來源，畫面顯示的是<strong>示範資料</strong>（隨機產生，不是真實股價），只能用來熟悉操作。
+      <Link href="/diagnose" className="ml-1 underline">檢查資料來源</Link>
     </div>
   );
 }

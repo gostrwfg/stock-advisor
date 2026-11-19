@@ -1,5 +1,6 @@
 import "server-only";
 import { computeIndicators } from "./indicators";
+import { mergeRealtime, parseFinMind, parseMis, parseStooqHistory, parseStooqQuote, type Realtime } from "./parsers";
 import { findLocal, guessMarket, normalizeSymbol, POPULAR_STOCKS, searchLocal, type StockInfo } from "./stockList";
 import type { Candle, Fundamentals, Market, NewsItem, Quote, StockData } from "./types";
 
@@ -76,8 +77,14 @@ interface YahooChartResponse {
 }
 
 async function yahooChart(yahooSymbol: string, range = "2y") {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?range=${range}&interval=1d&includePrePost=false`;
-  const data = await fetchJson<YahooChartResponse>(url);
+  const path = `/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?range=${range}&interval=1d&includePrePost=false`;
+  let data: YahooChartResponse;
+  try {
+    data = await fetchJson<YahooChartResponse>(`https://query1.finance.yahoo.com${path}`);
+  } catch (e) {
+    if (/HTTP 404/.test(String((e as Error).message))) throw e;
+    data = await fetchJson<YahooChartResponse>(`https://query2.finance.yahoo.com${path}`);
+  }
   const r = data.chart.result?.[0];
   if (!r || !r.timestamp) throw new Error(data.chart.error?.description ?? "查無資料");
   const q = r.indicators.quote[0];
@@ -260,56 +267,182 @@ function demoStock(symbol: string, market: Market, local?: StockInfo): StockData
   };
 }
 
+// ---------- 備援資料源 ----------
+
+const MIS_HEADERS = { Referer: "https://mis.twse.com.tw/stock/index.jsp", Accept: "application/json" };
+
+/** 證交所 MIS 即時報價（上市 tse / 上櫃 otc 一起查） */
+async function misRealtime(symbol: string): Promise<Realtime | null> {
+  const exCh = `tse_${symbol}.tw|otc_${symbol}.tw`;
+  const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(exCh)}&json=1&delay=0&_=${Date.now()}`;
+  const json = await fetchJson<unknown>(url, { headers: MIS_HEADERS });
+  return parseMis(json, symbol);
+}
+
+function dateNDaysAgo(days: number) {
+  return new Date(Date.now() - days * 86400e3).toISOString().slice(0, 10);
+}
+
+async function finmindHistory(symbol: string): Promise<Candle[]> {
+  const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${encodeURIComponent(symbol)}&start_date=${dateNDaysAgo(740)}`;
+  const headers: Record<string, string> = {};
+  if (process.env.FINMIND_TOKEN) headers.Authorization = `Bearer ${process.env.FINMIND_TOKEN}`;
+  const json = await fetchJson<{ status?: number; msg?: string }>(url, { headers });
+  const candles = parseFinMind(json);
+  if (!candles.length) throw new Error(`FinMind 無資料：${json.msg ?? ""}`);
+  return candles;
+}
+
+async function stooqHistory(symbol: string): Promise<Candle[]> {
+  const res = await fetchWithTimeout(`https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol.toLowerCase())}.us&i=d`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const candles = parseStooqHistory(await res.text()).filter((c) => c.time >= dateNDaysAgo(740));
+  if (!candles.length) throw new Error("Stooq 無資料");
+  return candles;
+}
+
+async function stooqQuote(symbol: string): Promise<Realtime | null> {
+  const res = await fetchWithTimeout(`https://stooq.com/q/l/?s=${encodeURIComponent(symbol.toLowerCase())}.us&f=sd2t2ohlcv&h&e=csv`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return parseStooqQuote(await res.text());
+}
+
+async function yahooQuote(yahooSymbol: string): Promise<Realtime | null> {
+  const { meta, candles } = await yahooChart(yahooSymbol, "5d");
+  const last = candles[candles.length - 1];
+  if (!last || meta.regularMarketPrice == null) return null;
+  return {
+    price: meta.regularMarketPrice,
+    previousClose: candles.length > 1 ? candles[candles.length - 2].close : null,
+    open: last.open,
+    high: meta.regularMarketDayHigh ?? last.high,
+    low: meta.regularMarketDayLow ?? last.low,
+    volume: meta.regularMarketVolume ?? last.volume,
+    date: last.time,
+    time: meta.regularMarketTime ? new Date(meta.regularMarketTime * 1000).toISOString() : new Date().toISOString(),
+    source: "Yahoo Finance",
+  };
+}
+
 // ---------- 對外 API ----------
 
-export async function getStockData(rawSymbol: string): Promise<StockData> {
+interface HistoryBundle {
+  candles: Candle[];
+  yahooSymbol: string;
+  name: string | null;
+  currency: string | null;
+  week52High: number | null;
+  week52Low: number | null;
+  source: string;
+}
+
+/** 依序嘗試多個資料源取得日 K */
+async function getHistory(symbol: string, market: Market, local?: StockInfo): Promise<HistoryBundle> {
+  const errors: string[] = [];
+  try {
+    const { meta, candles } = await resolveYahoo(symbol, market, local);
+    if (candles.length >= 2) {
+      return {
+        candles,
+        yahooSymbol: meta.symbol,
+        name: meta.longName ?? meta.shortName ?? null,
+        currency: meta.currency ?? null,
+        week52High: meta.fiftyTwoWeekHigh ?? null,
+        week52Low: meta.fiftyTwoWeekLow ?? null,
+        source: "Yahoo Finance",
+      };
+    }
+  } catch (e) {
+    errors.push(`Yahoo: ${(e as Error).message}`);
+  }
+  try {
+    const candles = market === "TW" ? await finmindHistory(symbol) : await stooqHistory(symbol);
+    return {
+      candles,
+      yahooSymbol: market === "TW" ? `${symbol}.${local?.exchange ?? "TW"}` : symbol,
+      name: null,
+      currency: market === "TW" ? "TWD" : "USD",
+      week52High: null,
+      week52Low: null,
+      source: market === "TW" ? "FinMind" : "Stooq",
+    };
+  } catch (e) {
+    errors.push(`${market === "TW" ? "FinMind" : "Stooq"}: ${(e as Error).message}`);
+  }
+  throw new Error(errors.join("；"));
+}
+
+/** 最新報價：台股用證交所即時報價，美股用 Yahoo、Stooq */
+async function getRealtime(symbol: string, market: Market, yahooSymbol: string): Promise<Realtime | null> {
+  return cached(`rt:${symbol}`, 15e3, async () => {
+    if (market === "TW") {
+      const r = await misRealtime(symbol).catch(() => null);
+      if (r) return r;
+      return yahooQuote(yahooSymbol).catch(() => null);
+    }
+    const y = await yahooQuote(yahooSymbol).catch(() => null);
+    if (y) return y;
+    return stooqQuote(symbol).catch(() => null);
+  });
+}
+
+function buildQuote(symbol: string, market: Market, name: string, currency: string, yahooSymbol: string, candles: Candle[], rt: Realtime | null): Quote {
+  const last = candles[candles.length - 1];
+  const prevBar = candles[candles.length - 2];
+  const price = rt?.price ?? last.close;
+  const previousClose = rt?.previousClose ?? prevBar?.close ?? last.open;
+  return {
+    symbol,
+    yahooSymbol,
+    name,
+    market,
+    currency,
+    price,
+    previousClose,
+    change: Math.round((price - previousClose) * 100) / 100,
+    changePercent: previousClose ? Math.round(((price - previousClose) / previousClose) * 10000) / 100 : 0,
+    dayHigh: rt?.high ?? last.high,
+    dayLow: rt?.low ?? last.low,
+    volume: rt?.volume ?? last.volume,
+    asOf: rt?.time ?? new Date(`${last.time}T00:00:00Z`).toISOString(),
+    realtimeSource: rt?.source ?? null,
+  };
+}
+
+function resolveSymbol(rawSymbol: string) {
   const symbol = normalizeSymbol(rawSymbol);
   if (!/^[A-Z0-9.\-^=]{1,12}$/.test(symbol)) throw new Error("股票代號格式不正確");
   const local = findLocal(symbol);
   const market = local?.market ?? guessMarket(symbol);
+  return { symbol, local, market };
+}
 
+export async function getStockData(rawSymbol: string): Promise<StockData> {
+  const { symbol, local, market } = resolveSymbol(rawSymbol);
   if (forceDemo()) return demoStock(symbol, market, local);
 
-  return cached(`stock:${symbol}`, 5 * 60e3, async () => {
-    let chart: Awaited<ReturnType<typeof yahooChart>>;
+  // 歷史 K 線與基本面快取 10 分鐘；最新報價另外快取 15 秒
+  const base = await cached(`stock:${symbol}`, 10 * 60e3, async () => {
+    let hist: HistoryBundle;
     try {
-      chart = await resolveYahoo(symbol, market, local);
+      hist = await getHistory(symbol, market, local);
     } catch (e) {
       // 連不上外部資料源 → 熱門清單內的股票改用示範資料；其他代號視為查無此股
-      if (local || isNetworkError(e)) return demoStock(symbol, market, local);
+      // 備援資料源明確回覆「無資料」時，代表代號不存在
+      if (!local && /無資料/.test((e as Error).message)) throw new Error(`找不到股票「${symbol}」，請確認代號是否正確`);
+      if (local || isNetworkError(e)) return { demo: demoStock(symbol, market, local) as StockData };
       throw new Error(`找不到股票「${symbol}」，請確認代號是否正確`);
     }
-    const { meta, candles } = chart;
-    if (candles.length < 2) throw new Error("歷史資料不足");
-    const lastC = candles[candles.length - 1];
-    const prevClose = candles[candles.length - 2].close;
-    const price = meta.regularMarketPrice ?? lastC.close;
-    const quote: Quote = {
-      symbol,
-      yahooSymbol: meta.symbol,
-      name: local?.name ?? meta.longName ?? meta.shortName ?? symbol,
-      market,
-      currency: meta.currency ?? (market === "TW" ? "TWD" : "USD"),
-      price,
-      previousClose: prevClose,
-      change: Math.round((price - prevClose) * 100) / 100,
-      changePercent: Math.round(((price - prevClose) / prevClose) * 10000) / 100,
-      dayHigh: meta.regularMarketDayHigh ?? lastC.high,
-      dayLow: meta.regularMarketDayLow ?? lastC.low,
-      volume: meta.regularMarketVolume ?? lastC.volume,
-      asOf: meta.regularMarketTime ? new Date(meta.regularMarketTime * 1000).toISOString() : new Date().toISOString(),
-    };
-    const recent = candles.slice(-250);
+    const recent = hist.candles.slice(-250);
     const fundamentals: Fundamentals = {
-      week52High: meta.fiftyTwoWeekHigh ?? Math.max(...recent.map((c) => c.high)),
-      week52Low: meta.fiftyTwoWeekLow ?? Math.min(...recent.map((c) => c.low)),
+      week52High: hist.week52High ?? Math.max(...recent.map((c) => c.high)),
+      week52Low: hist.week52Low ?? Math.min(...recent.map((c) => c.low)),
       sector: local?.sector ?? null,
-      source: ["Yahoo Finance（股價）"],
+      source: [`${hist.source}（股價）`],
     };
-    const dataSources = ["Yahoo Finance"];
-
+    const dataSources = [hist.source];
     const [yf, tw] = await Promise.all([
-      yahooFundamentals(meta.symbol).catch(() => null),
+      hist.source === "Yahoo Finance" ? yahooFundamentals(hist.yahooSymbol).catch(() => null) : Promise.resolve(null),
       market === "TW" ? twValuation(symbol).catch(() => null) : Promise.resolve(null),
     ]);
     if (yf) {
@@ -326,9 +459,61 @@ export async function getStockData(rawSymbol: string): Promise<StockData> {
       fundamentals.source.push("臺灣證券交易所 / 櫃買中心 OpenAPI");
       dataSources.push("TWSE/TPEx OpenAPI");
     }
-
-    return { quote, history: candles, indicators: computeIndicators(candles), fundamentals, isDemo: false, dataSources };
+    return { hist, fundamentals, dataSources };
   });
+
+  if ("demo" in base && base.demo) return base.demo;
+  if (!("hist" in base) || !base.hist) throw new Error("資料錯誤");
+  const { hist, fundamentals, dataSources } = base;
+  const rt = await getRealtime(symbol, market, hist.yahooSymbol);
+  const candles = rt ? mergeRealtime(hist.candles, rt) : hist.candles;
+  const name = local?.name ?? hist.name ?? rt?.name ?? symbol;
+  const quote = buildQuote(symbol, market, name, hist.currency ?? (market === "TW" ? "TWD" : "USD"), hist.yahooSymbol, candles, rt);
+  return {
+    quote,
+    history: candles,
+    indicators: computeIndicators(candles),
+    fundamentals,
+    isDemo: false,
+    dataSources: rt && !dataSources.includes(rt.source) ? [...dataSources, rt.source] : dataSources,
+  };
+}
+
+/** 只取最新報價（給頁面每 30 秒更新用） */
+export async function getQuote(rawSymbol: string): Promise<{ quote: Quote; isDemo: boolean }> {
+  const d = await getStockData(rawSymbol);
+  return { quote: d.quote, isDemo: d.isDemo };
+}
+
+/** 檢查每個資料源在目前主機上能不能用 */
+export async function diagnoseSources() {
+  const test = async (name: string, fn: () => Promise<unknown>) => {
+    const t0 = Date.now();
+    try {
+      const r = await fn();
+      const ok = Array.isArray(r) ? r.length > 0 : r != null;
+      return { name, ok, ms: Date.now() - t0, detail: Array.isArray(r) ? `${r.length} 筆` : ok ? JSON.stringify(r).slice(0, 120) : "無資料" };
+    } catch (e) {
+      const cause = (e as { cause?: { code?: string; message?: string } }).cause;
+      const why = cause ? `（${cause.code ?? cause.message ?? ""}）` : "";
+      return { name, ok: false, ms: Date.now() - t0, detail: `${(e as Error).message}${why}`.slice(0, 200) };
+    }
+  };
+  return Promise.all([
+    test("Yahoo 台股 K 線 (2330.TW)", async () => (await yahooChart("2330.TW", "5d")).candles),
+    test("Yahoo 美股 K 線 (AAPL)", async () => (await yahooChart("AAPL", "5d")).candles),
+    test("Yahoo 財務數據 (crumb)", async () => (await getYahooCrumb()).crumb ? "ok" : null),
+    test("證交所即時報價 (2330)", () => misRealtime("2330")),
+    test("FinMind 台股 K 線 (2330)", () => finmindHistory("2330")),
+    test("證交所本益比 OpenAPI", () => twValuation("2330")),
+    test("Stooq 美股 K 線 (AAPL)", () => stooqHistory("AAPL")),
+    test("Stooq 美股報價 (AAPL)", () => stooqQuote("AAPL")),
+    test("Google 新聞 RSS", async () => {
+      const res = await fetchWithTimeout("https://news.google.com/rss/search?q=%E5%8F%B0%E7%A9%8D%E9%9B%BB&hl=zh-TW&gl=TW&ceid=TW:zh-Hant");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return parseRss(await res.text());
+    }),
+  ]);
 }
 
 function isNetworkError(e: unknown) {

@@ -47,6 +47,41 @@ export default function StockPage({ params }: { params: Promise<{ symbol: string
     };
   }, [symbol]);
 
+  // 每 30 秒更新最新報價（分頁在背景時暫停）
+  const [lastPoll, setLastPoll] = useState<number | null>(null);
+  const [flash, setFlash] = useState<"up" | "down" | null>(null);
+  const loaded = data != null && !data.isDemo;
+  useEffect(() => {
+    if (!loaded) return;
+    let alive = true;
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const r = await api<{ quote: StockData["quote"]; isDemo: boolean }>(`/api/quote/${encodeURIComponent(symbol)}`);
+        if (!alive) return;
+        setData((d) => {
+          if (!d) return d;
+          if (r.quote.price !== d.quote.price) {
+            setFlash(r.quote.price > d.quote.price ? "up" : "down");
+            window.setTimeout(() => setFlash(null), 1200);
+          }
+          return { ...d, quote: r.quote };
+        });
+        setLastPoll(Date.now());
+      } catch {
+        /* 下次再試 */
+      }
+    };
+    const t = window.setInterval(poll, 30_000);
+    const onVisible = () => document.visibilityState === "visible" && poll();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [loaded, symbol]);
+
   if (error) {
     return (
       <div className="space-y-4">
@@ -82,13 +117,22 @@ export default function StockPage({ params }: { params: Promise<{ symbol: string
             {f.sector && <Badge>{f.sector}</Badge>}
           </div>
           <div className="mt-1 flex items-baseline gap-3">
-            <span className={`text-3xl font-bold tabular ${changeClass(q.change)}`}>{fmtNum(q.price)}</span>
+            <span className={`rounded-lg px-1 text-3xl font-bold tabular transition-colors duration-700 ${changeClass(q.change)} ${flash ? "bg-surface-2" : ""}`}>{fmtNum(q.price)}</span>
             <span className={`tabular ${changeClass(q.change)}`}>
               {q.change > 0 ? "▲" : q.change < 0 ? "▼" : ""} {fmtNum(Math.abs(q.change))}（{fmtPct(q.changePercent)}）
             </span>
             <span className="text-xs text-muted">{q.currency}</span>
           </div>
-          <p className="mt-0.5 text-xs text-muted">資料時間：{new Date(q.asOf).toLocaleString("zh-TW")} · 來源：{data.dataSources.join("、")}</p>
+          <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted">
+            {!data.isDemo && (
+              <span className={q.realtimeSource ? "text-accent" : ""}>
+                {q.realtimeSource ? "● 自動更新中（每 30 秒）" : "收盤資料"}
+              </span>
+            )}
+            <span>報價時間：{new Date(q.asOf).toLocaleString("zh-TW")}</span>
+            {lastPoll && <span>最後檢查：{new Date(lastPoll).toLocaleTimeString("zh-TW")}</span>}
+            <span>來源：{data.dataSources.join("、")}</span>
+          </p>
         </div>
         {hydrated && (
           <div className="flex flex-wrap gap-2">

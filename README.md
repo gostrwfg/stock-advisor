@@ -73,9 +73,16 @@ npm test
 
 ## 資料來源
 
-- 股價、K 線、美股財務數據、搜尋：Yahoo Finance（非官方公開端點）
-- 台股本益比／殖利率／淨值比：臺灣證券交易所、櫃買中心 OpenAPI
-- 新聞：Google 新聞 RSS、Yahoo Finance
+| 資料 | 主要來源 | 備援 |
+| --- | --- | --- |
+| 台股日 K | Yahoo Finance | FinMind |
+| 台股即時報價（盤中約 5 秒更新） | 臺灣證券交易所 MIS | Yahoo Finance |
+| 美股日 K、報價 | Yahoo Finance | Stooq |
+| 台股本益比／殖利率／淨值比 | 證交所、櫃買中心 OpenAPI | — |
+| 美股財務數據、搜尋 | Yahoo Finance | 內建熱門清單 |
+| 新聞 | Google 新聞 RSS、Yahoo Finance | — |
+
+個股頁開著時每 30 秒自動更新報價（分頁在背景時暫停）。打開網站的 `/diagnose` 頁面，可以檢查主機連不連得到每個資料來源。
 
 **連不上資料來源時**（例如網路受限），系統會自動改用「示範資料」，畫面頂端會清楚標示，方便離線展示與測試。
 

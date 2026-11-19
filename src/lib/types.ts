@@ -23,6 +23,7 @@ export interface Quote {
   dayLow?: number;
   volume?: number;
   asOf: string; // ISO time
+  realtimeSource?: string | null; // 最新報價來源，null 表示只有收盤資料
 }
 
 export interface Fundamentals {
