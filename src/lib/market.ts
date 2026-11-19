@@ -374,7 +374,7 @@ async function getHistory(symbol: string, market: Market, local?: StockInfo): Pr
 
 /** 最新報價：台股用證交所即時報價，美股用 Yahoo、Stooq */
 async function getRealtime(symbol: string, market: Market, yahooSymbol: string): Promise<Realtime | null> {
-  return cached(`rt:${symbol}`, 15e3, async () => {
+  return cached(`rt:${symbol}`, 4e3, async () => {
     if (market === "TW") {
       const r = await misRealtime(symbol).catch(() => null);
       if (r) return r;
@@ -479,7 +479,7 @@ export async function getStockData(rawSymbol: string): Promise<StockData> {
   };
 }
 
-/** 只取最新報價（給頁面每 30 秒更新用） */
+/** 只取最新報價（給頁面每 5 秒更新用） */
 export async function getQuote(rawSymbol: string): Promise<{ quote: Quote; isDemo: boolean }> {
   const d = await getStockData(rawSymbol);
   return { quote: d.quote, isDemo: d.isDemo };

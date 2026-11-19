@@ -47,15 +47,17 @@ export default function StockPage({ params }: { params: Promise<{ symbol: string
     };
   }, [symbol]);
 
-  // 每 30 秒更新最新報價（分頁在背景時暫停）
+  // 每 5 秒更新最新報價（分頁在背景時暫停）
   const [lastPoll, setLastPoll] = useState<number | null>(null);
   const [flash, setFlash] = useState<"up" | "down" | null>(null);
   const loaded = data != null && !data.isDemo;
   useEffect(() => {
     if (!loaded) return;
     let alive = true;
+    let busy = false; // 上一次還沒回來就不要再發，避免請求堆積
     const poll = async () => {
-      if (document.visibilityState !== "visible") return;
+      if (document.visibilityState !== "visible" || busy) return;
+      busy = true;
       try {
         const r = await api<{ quote: StockData["quote"]; isDemo: boolean }>(`/api/quote/${encodeURIComponent(symbol)}`);
         if (!alive) return;
@@ -70,9 +72,11 @@ export default function StockPage({ params }: { params: Promise<{ symbol: string
         setLastPoll(Date.now());
       } catch {
         /* 下次再試 */
+      } finally {
+        busy = false;
       }
     };
-    const t = window.setInterval(poll, 30_000);
+    const t = window.setInterval(poll, 5_000);
     const onVisible = () => document.visibilityState === "visible" && poll();
     document.addEventListener("visibilitychange", onVisible);
     return () => {
@@ -126,7 +130,7 @@ export default function StockPage({ params }: { params: Promise<{ symbol: string
           <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted">
             {!data.isDemo && (
               <span className={q.realtimeSource ? "text-accent" : ""}>
-                {q.realtimeSource ? "● 自動更新中（每 30 秒）" : "收盤資料"}
+                {q.realtimeSource ? "● 自動更新中（每 5 秒）" : "收盤資料"}
               </span>
             )}
             <span>報價時間：{new Date(q.asOf).toLocaleString("zh-TW")}</span>
